@@ -1,3 +1,17 @@
+=== About this version ===
+
+This is a fork of:
+
+https://wordpress.org/plugins/simple-auto-poster-for-bluesky/
+
+It works the same, but formats the resulting post differently.
+Instead of using a "site card"-like thing, it just includes the
+featured image in the post.
+
+If also fixes two bugs: It finds a version of that image that's small
+enough for Bluesky, and it also avoids posting to Bluesky if you're
+just updating an old post (that hasn't been posted to Bluesky yet).
+
 === Simple Auto-Poster for Bluesky ===
 Contributors: lunaraurora
 Tags: bluesky, social, auto, share, networks

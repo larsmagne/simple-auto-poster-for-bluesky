@@ -1,8 +1,8 @@
 <?php
 /*
-* Plugin Name: Simple Auto-Poster for Bluesky
+* Plugin Name: Lars Post Bluesky
 * Description: Automatically posts to Bluesky when a WordPress post is published, including featured images
-* Version: 1.3
+* Version: 1.1
 * Author: Emma Blackwell
 * Author URI: https://themotorsport.net/
 * License: GPLv2 or later
@@ -20,16 +20,17 @@ class Simple_Bluesky_Poster {
     private $identifier;
     private $password;
     private $log_file;
+    private $image_size;
 
     public function __construct() {
-        add_action('publish_post', [$this, 'handle_post'], 10, 2);
+        add_action('publish_post', [$this, 'handle_post'], 10, 3);
+        // add_action('wp_insert_post', [$this, 'handle_post'], 10, 3);
         add_action('admin_menu', [$this, 'add_settings_page']);
         add_action('admin_init', [$this, 'register_settings']);
         add_action('plugins_loaded', [$this, 'load_plugin_textdomain']);
         // Set up logging
         $upload_dir = wp_upload_dir();
         $this->log_file = $upload_dir['basedir'] . '/bluesky_poster_log.txt';
-        $this->log(__("Plugin initialized", 'simple-auto-poster-for-bluesky'));
     }
 
     public function load_plugin_textdomain() {
@@ -55,26 +56,17 @@ class Simple_Bluesky_Poster {
     }
 
     public function handle_post($post_ID, $post, $update = null) {
+        $this->log(__("Handling post", 'simple-auto-poster-for-bluesky'));
         $this->log(sprintf(
             /* translators: %d: Post ID */
             __('handle_post called for post ID: %d', 'simple-auto-poster-for-bluesky'),
             $post_ID
         ));
-    
-        // Clear 'bluesky_shared' meta if the post is cloned
-        if (get_post_meta($post_ID, '_dp_original', true)) {
-            $this->log(__('Cloned post detected, clearing bluesky_shared meta key', 'simple-auto-poster-for-bluesky'));
-            delete_post_meta($post_ID, 'bluesky_shared');
-        }
-		
-        // Check if this is a new post or an update
-        if ($update && get_post_field('post_date', $post_ID) != get_post_field('post_modified', $post_ID)) {
-            $this->log(__("This is a post update, not initial publish - skipping", 'simple-auto-poster-for-bluesky'));
-            return;
-        }
         
-        if (get_post_status($post_ID) === 'publish' && get_post_type($post_ID) === 'post') {
-            $this->log(__("Post is published and of type 'post', calling post_to_bluesky", 'simple-auto-poster-for-bluesky'));
+        if (get_post_status($post_ID) === 'publish' &&
+            get_post_type($post_ID) === 'post' &&
+            $update != "publish") {
+            $this->log(__("Post '$post_ID' is published and of type 'post', update is '$update', calling post_to_bluesky", 'simple-auto-poster-for-bluesky'));
             $this->post_to_bluesky($post_ID, $post);
         } else {
             $this->log(__("Post is not published or not of type 'post', skipping", 'simple-auto-poster-for-bluesky'));
@@ -159,18 +151,31 @@ class Simple_Bluesky_Poster {
         $permalink = get_permalink($post_ID);
         
         // Fetch OpenGraph data
-		$og_data = $this->get_og_data($permalink);
-		if (isset ( $og_data['published_time'] ) ){ $createdAt = $og_data['published_time']; } // timestamp scraped from post at $permalink
-		else { $createdAt = gmdate('c'); } // default timestamp
-		
-		$post_data = [
-			'repo' => $did,
-			'collection' => 'app.bsky.feed.post',
-			'record' => [
-				'text' => '', // Empty text field
-				'createdAt' => $createdAt
-			]
-		];
+        $og_data = $this->get_og_data($permalink);
+        $text = html_entity_decode($og_data['title'] ?? $post->post_title, ENT_QUOTES, 'UTF-8');
+        
+        $post_data = [
+            'repo' => $did,
+            'collection' => 'app.bsky.feed.post',
+            'record' => [
+              'text' => $text . " " . $permalink,
+              'createdAt' => gmdate('c'),
+              'facets' => [
+                [
+                  'index' => [
+                    'byteStart' => strlen($text) + 1,
+                    'byteEnd' => strlen($text) + 1 + strlen($permalink)
+                  ],
+                  'features' => [
+                    [
+                      '$type' => 'app.bsky.richtext.facet#link',
+                      'uri' => $permalink
+                    ]
+                  ]
+                ]
+              ]
+            ]
+        ];
     
         $image_blob = '';
         if (isset($image_path) && file_exists($image_path)) {
@@ -198,12 +203,12 @@ class Simple_Bluesky_Poster {
         }
 
         $external_embed = [
-            '$type' => 'app.bsky.embed.external',
-            'external' => [
-                'uri' => $permalink,
-                'title' => html_entity_decode($og_data['title'] ?? $post->post_title, ENT_QUOTES, 'UTF-8'),
-                'description' => html_entity_decode($og_data['description'] ?? wp_trim_words($post->post_content, 30, '...'), ENT_QUOTES, 'UTF-8'),
-                'thumb' => $image_blob,
+            '$type' => 'app.bsky.embed.images',
+            'images' => [
+              [
+                'alt' => '',
+                'image' => $image_blob
+              ]
             ]
         ];
 
@@ -216,7 +221,11 @@ class Simple_Bluesky_Poster {
             ));
             $uploaded_blob = $this->upload_image_to_bluesky($image_url, $access_token);
             if ($uploaded_blob) {
-                $external_embed['external']['thumb'] = $uploaded_blob;
+                $external_embed['images'][0]['image'] = $uploaded_blob;
+                $external_embed['images'][0]['aspectRatio'] = [
+                    'width' => $this->image_size[0],
+                    'height' => $this->image_size[1]
+                ];
                 $this->log(__("Image uploaded successfully", 'simple-auto-poster-for-bluesky'));
             } else {
                 $this->log(__("Failed to upload image", 'simple-auto-poster-for-bluesky'));
@@ -260,38 +269,27 @@ class Simple_Bluesky_Poster {
                 __("Successfully posted to Bluesky. Response: %s", 'simple-auto-poster-for-bluesky'),
                 wp_json_encode($response_body)
             ));
-            if (wp_remote_retrieve_response_code($post_response) === 200) {
             update_post_meta($post_ID, 'bluesky_shared', true);
-            $this->log(sprintf(
-                /* translators: %s: Response body */
-                __("Successfully posted to Bluesky. Response: %s", 'simple-auto-poster-for-bluesky'),
-                wp_json_encode($response_body)
-            ));
-        }
-        
         }
     }
 
-	private function get_og_data($url) {
-		$response = wp_remote_get($url);
-		$html = wp_remote_retrieve_body($response);
-		
-		$og_data = [];
-		if (preg_match('/<meta property="og:title" content="(.*?)"/', $html, $match)) {
-			$og_data['title'] = $match[1];
-		}
-		if (preg_match('/<meta property="og:description" content="(.*?)"/', $html, $match)) {
-			$og_data['description'] = $match[1];
-		}
-		if (preg_match('/<meta property="og:image" content="(.*?)"/', $html, $match)) {
-			$og_data['image'] = $match[1];
-		}
-		if (preg_match('/<meta property="article:published_time" content="(.*?)"/', $html, $match)) {
-			$og_data['published_time'] = $match[1];
-		}
-		
-		return $og_data;
-	}
+    private function get_og_data($url) {
+        $response = wp_remote_get($url);
+        $html = wp_remote_retrieve_body($response);
+        
+        $og_data = [];
+        if (preg_match('/<meta property="og:title" content="(.*?)"/', $html, $match)) {
+            $og_data['title'] = $match[1];
+        }
+        if (preg_match('/<meta property="og:description" content="(.*?)"/', $html, $match)) {
+            $og_data['description'] = $match[1];
+        }
+        if (preg_match('/<meta property="og:image" content="(.*?)"/', $html, $match)) {
+            $og_data['image'] = $match[1];
+        }
+        
+        return $og_data;
+    }
 
     private function upload_image_to_bluesky($image_url, $access_token) {
         $upload_url = 'https://bsky.social/xrpc/com.atproto.repo.uploadBlob';
@@ -309,6 +307,49 @@ class Simple_Bluesky_Poster {
         $image_content = wp_remote_retrieve_body($image_data);
         $image_mime = wp_remote_retrieve_header($image_data, 'content-type');
 
+        /* Bluesky has a max size for images.  Look through the image
+           directory to find the largest version of the image to be
+           included that's small enough. */
+
+        $root = ABSPATH;
+        $file = $root . preg_replace("/^.*wp-content/", "wp-content",
+                                     $image_url);
+        $dir = dirname($file);
+        $base = basename($file);
+        $ext = pathinfo($file, PATHINFO_EXTENSION);
+        $match = preg_replace("/-scaled/", "", $base);
+        $match = preg_replace("/[.]$ext/", "", $match);
+        $this->log("Trying to find a match for $match");
+        $this->log("Match: $match-(([0-9]+x)|scaled)[.]$ext");
+        
+        $files = scandir($dir);
+
+        $found = array();
+        foreach ($files as $f) {
+            if (preg_match("/^$match-(([0-9]+x[0-9]+)|scaled)[.]$ext/", $f) ||
+                $f == $base) {
+                $this->log("Found: $f");
+                $found[] = [filesize($dir . "/" . $f), $f];
+            }
+        }
+
+        usort($found, function($a, $b) {
+            return $b[0] - $a[0];
+        });
+
+        $result = false;
+        foreach ($found as $elem) {
+            if ($elem[0] < 630000) {
+                $result = $dir . "/" . $elem[1];
+                break;
+            }
+        }
+        
+        if ($result) {
+            $image_content = file_get_contents($result);
+            $this->image_size = getimagesize($result);
+        }
+        
         $upload_response = wp_remote_post($upload_url, [
             'body' => $image_content,
             'headers' => [
